@@ -1,0 +1,12 @@
+/node_modules/
+/.idea/
+/deploy/ymls/
+/coverage
+/.nyc_output
+junit.xml
+src/config/dev.js
+src/config/production.js
+src/config/qa.js
+src/config/development.js
+.env
+
