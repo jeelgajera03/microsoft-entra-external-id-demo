@@ -5,7 +5,7 @@ const path = require('path');
 const dotenv = require('dotenv');
 const crypto = require('crypto');
 const axios = require('axios');
-const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+const nodemailer = require('nodemailer');
 
 // Load environment variables
 dotenv.config();
@@ -18,6 +18,11 @@ app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.static('public'));
 
+// In-memory store for OTP codes (in production, use a database)
+const otpStore = new Map(); // userId -> { code, expiresAt }
+const mfaStore = new Map(); // userId -> { mfaEmail, enabled }
+const sessionStore = new Map(); // sessionId -> { userId, expiresAt }
+
 // MSAL Configuration
 const msalConfig = {
   auth: {
@@ -29,6 +34,15 @@ const msalConfig = {
 
 const cca = new msal.ConfidentialClientApplication(msalConfig);
 
+// Nodemailer Configuration
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS
+  }
+});
+
 async function getGraphToken() {
   const tokenRequest = {
     scopes: ['https://graph.microsoft.com/.default'],
@@ -36,6 +50,16 @@ async function getGraphToken() {
   };
   const response = await cca.acquireTokenByClientCredential(tokenRequest);
   return response.accessToken;
+}
+
+// Generate secure random OTP
+function generateOTP() {
+  return crypto.randomInt(100000, 999999).toString();
+}
+
+// Generate a session token
+function generateSessionToken() {
+  return crypto.randomBytes(32).toString('hex');
 }
 
 // API: Create User
@@ -53,85 +77,81 @@ app.post('/api/create-user', async (req, res) => {
     if (!email || !displayName || !givenName || !surname || !mailNickname) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
+
     const token = await getGraphToken();
     const verifiedDomain = process.env.VERIFIED_DOMAIN || 'demovijayorg.onmicrosoft.com';
     const userPrincipalName = `${mailNickname}@${verifiedDomain}`;
     const tempPassword = crypto.randomBytes(12).toString('base64').slice(0, 16) + '!1Aa';
 
-    // Create user with external identity
-    const createUserResponse = await fetch('https://graph.microsoft.com/v1.0/users', {
-      method: 'POST',
+    // Create user with external identity using axios
+    const createUserResponse = await axios.post('https://graph.microsoft.com/v1.0/users', {
+      accountEnabled: true,
+      displayName,
+      mailNickname,
+      userPrincipalName,
+      passwordProfile: {
+        forceChangePasswordNextSignIn: true,
+        password: tempPassword
+      },
+      passwordPolicies: "DisablePasswordExpiration",
+      mail: email,
+      givenName,
+      surname,
+      identities: [
+        {
+          signInType: "emailAddress",
+          issuer: verifiedDomain,
+          issuerAssignedId: email
+        }
+      ],
+      userType: "Guest"
+    }, {
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${token}`
-      },
-      body: JSON.stringify({
-        accountEnabled: true,
-        displayName,
-        mailNickname,
-        userPrincipalName,
-        passwordProfile: {
-          forceChangePasswordNextSignIn: true,
-          password: tempPassword
-        },
-        passwordPolicies: "DisablePasswordExpiration",
-        mail: email,
-        givenName,
-        surname,
-        identities: [
-          {
-            signInType: "emailAddress",
-            issuer: verifiedDomain,
-            issuerAssignedId: email
-          }
-        ],
-        // Explicitly set userType to Guest for external accounts
-        userType: "Guest"
-      })
+      }
     });
 
-    if (createUserResponse.status === 201) {
-      const userData = await createUserResponse.json();
-      
-      // Send invitation
-      const inviteResponse = await fetch('https://graph.microsoft.com/v1.0/invitations', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
-        body: JSON.stringify({
-          invitedUserEmailAddress: email,
-          inviteRedirectUrl: `${process.env.BASE_URL}/set-password?email=${encodeURIComponent(email)}`,
-          sendInvitationMessage: true,
-          invitedUserMessageInfo: {
-            customizedMessageBody: `Hello ${givenName},\n\nYou have been invited to join our organization as an external user. Please click the link below to set up your account and configure Multi-Factor Authentication (MFA).\n\nIf you have any questions, please contact our support team.\n\nBest regards,\nThe IT Team`
-          },
-          invitedUser: { id: userData.id }
-        })
-      });
+    const userData = createUserResponse.data;
+    console.log({userData});
 
-      if (inviteResponse.ok) {
-        const inviteData = await inviteResponse.json();
-        res.json({
-          success: true,
-          message: 'User created and invitation sent',
-          data: { id: userData.id, inviteUrl: inviteData.inviteRedeemUrl }
-        });
-      } else {
-        const errorData = await inviteResponse.json();
-        res.status(inviteResponse.status).json({ error: 'Failed to send invitation', details: errorData.error });
-      }
-    } else {
-      const errorData = await createUserResponse.json();
-      res.status(createUserResponse.status).json({ error: 'Failed to create user', details: errorData.error });
-    }
+    // Generate custom invitation URL
+    const inviteUrl = `${process.env.BASE_URL}/set-password?userId=${userData.id}`;
+
+    // Send custom email using nodemailer
+    const mailOptions = {
+      from: process.env.EMAIL_USER,
+      to: email,
+      subject: 'Welcome to Our Organization - Account Setup',
+      html: `
+        <h2>Hello ${givenName},</h2>
+        <p>You have been invited to join our organization as an external user.</p>
+        <p>Please click the link below to set up your account and configure Multi-Factor Authentication (MFA):</p>
+        <a href="${inviteUrl}" style="display: inline-block; padding: 10px 20px; background-color: #007bff; color: white; text-decoration: none; border-radius: 5px;">Set Up Account</a>
+        <p>You will be prompted to change this password upon first login.</p>
+        <p>If you have any questions, please contact our support team at support@organization.com.</p>
+        <p>Best regards,<br>The IT Team</p>
+      `
+    };
+
+    await transporter.sendMail(mailOptions);
+
+    res.json({
+      success: true,
+      message: 'User created and custom invitation email sent',
+      data: { id: userData.id, inviteUrl }
+    });
+
   } catch (error) {
-    res.status(500).json({ error: 'Server error', details: error.message });
+    console.error('Error:', error.response?.data || error.message);
+    res.status(500).json({ 
+      error: 'Server error', 
+      details: error.response?.data?.error?.message || error.message 
+    });
   }
 });
 
-
+// API: Set Password
 app.post('/api/set-password', async (req, res) => {
   try {
     const { password } = req.body;
@@ -155,38 +175,57 @@ app.post('/api/set-password', async (req, res) => {
 
     const token = await getGraphToken();
 
-    // Update user's password and invitation state
-    const updateUserResponse = await fetch(`https://graph.microsoft.com/v1.0/users/${userId}`, {
-      method: 'PATCH',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`
-      },
-      body: JSON.stringify({
+    // Update user's password
+    const updateUserResponse = await axios.patch(
+      `https://graph.microsoft.com/v1.0/users/${userId}`,
+      {
         passwordProfile: {
-          forceChangePasswordNextSignIn: true, // Require password change on next login
+          forceChangePasswordNextSignIn: false,
           password
-        },
-      })
-    });
+        }
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        }
+      }
+    );
 
-    if (updateUserResponse.ok) {
-      res.json({
-        success: true,
-        message: 'Password set succesfully'
-      });
-    } else {
-      const errorData = await updateUserResponse.json();
-      res.status(updateUserResponse.status).json({ error: 'Failed to update user', details: errorData.error });
-    }
+    // Get user information to retrieve email for MFA setup
+    const userResponse = await axios.get(
+      `https://graph.microsoft.com/v1.0/users/${userId}?$select=mail,displayName`,
+      {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      }
+    );
+
+    const userData = userResponse.data;
+
+    res.json({
+      success: true,
+      message: 'Password set successfully',
+      user: {
+        id: userId,
+        email: userData.mail,
+        displayName: userData.displayName
+      }
+    });
   } catch (error) {
-    res.status(500).json({ error: 'Server error', details: error.message });
+    console.error('Error:', error.response?.data || error.message);
+    res.status(500).json({ 
+      error: 'Server error', 
+      details: error.response?.data?.error?.message || error.message 
+    });
   }
 });
+
+
 
 // Start the server
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Base URL: ${process.env.BASE_URL || 'http://localhost:' + PORT}`);
 });
-
