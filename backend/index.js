@@ -6,6 +6,7 @@ const dotenv = require('dotenv');
 const crypto = require('crypto');
 const axios = require('axios');
 const nodemailer = require('nodemailer');
+const cors = require('cors');
 
 // Load environment variables
 dotenv.config();
@@ -17,6 +18,15 @@ const PORT = process.env.PORT || 3000;
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.static('public'));
+app.use(cors());
+app.use(cors({
+  origin: 'http://localhost:3001',
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  credentials: true // if you are using cookies
+
+}));
+
+
 
 // In-memory store for OTP codes (in production, use a database)
 const otpStore = new Map(); // userId -> { code, expiresAt }
