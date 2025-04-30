@@ -41,18 +41,24 @@ async function getGraphToken() {
 // API: Create User
 app.post('/api/create-user', async (req, res) => {
   try {
-    const { email } = req.body;
-    if (!email) {
-      return res.status(400).json({ error: 'Email is required' });
+    const {
+      email,
+      displayName,
+      givenName,
+      surname,
+      mailNickname,
+    } = req.body;
+
+    // Validate required fields
+    if (!email || !displayName || !givenName || !surname || !mailNickname) {
+      return res.status(400).json({ error: 'Missing required fields' });
     }
-    
     const token = await getGraphToken();
     const verifiedDomain = process.env.VERIFIED_DOMAIN || 'demovijayorg.onmicrosoft.com';
-    const localPart = email.split('@')[0].replace(/[^a-zA-Z0-9]/g, '') + '_' + Date.now(); // Ensure unique UPN
-    const userPrincipalName = `${localPart}@${verifiedDomain}`;
+    const userPrincipalName = `${mailNickname}@${verifiedDomain}`;
     const tempPassword = crypto.randomBytes(12).toString('base64').slice(0, 16) + '!1Aa';
 
-    // Create user
+    // Create user with external identity
     const createUserResponse = await fetch('https://graph.microsoft.com/v1.0/users', {
       method: 'POST',
       headers: {
@@ -61,15 +67,26 @@ app.post('/api/create-user', async (req, res) => {
       },
       body: JSON.stringify({
         accountEnabled: true,
-        displayName: localPart,
-        mailNickname: localPart,
+        displayName,
+        mailNickname,
         userPrincipalName,
         passwordProfile: {
           forceChangePasswordNextSignIn: true,
           password: tempPassword
         },
         passwordPolicies: "DisablePasswordExpiration",
-        mail: email
+        mail: email,
+        givenName,
+        surname,
+        identities: [
+          {
+            signInType: "emailAddress",
+            issuer: verifiedDomain,
+            issuerAssignedId: email
+          }
+        ],
+        // Explicitly set userType to Guest for external accounts
+        userType: "Guest"
       })
     });
 
@@ -88,7 +105,7 @@ app.post('/api/create-user', async (req, res) => {
           inviteRedirectUrl: `${process.env.BASE_URL}/set-password?email=${encodeURIComponent(email)}`,
           sendInvitationMessage: true,
           invitedUserMessageInfo: {
-            customizedMessageBody: 'Please set up your account and MFA.'
+            customizedMessageBody: `Hello ${givenName},\n\nYou have been invited to join our organization as an external user. Please click the link below to set up your account and configure Multi-Factor Authentication (MFA).\n\nIf you have any questions, please contact our support team.\n\nBest regards,\nThe IT Team`
           },
           invitedUser: { id: userData.id }
         })
@@ -112,5 +129,11 @@ app.post('/api/create-user', async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: 'Server error', details: error.message });
   }
+});
+
+// Start the server
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Base URL: ${process.env.BASE_URL || 'http://localhost:' + PORT}`);
 });
 
