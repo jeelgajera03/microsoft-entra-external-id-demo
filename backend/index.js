@@ -131,6 +131,59 @@ app.post('/api/create-user', async (req, res) => {
   }
 });
 
+
+app.post('/api/set-password', async (req, res) => {
+  try {
+    const { password } = req.body;
+    const { userId } = req.query;
+
+    // Validate inputs
+    if (!password) {
+      return res.status(400).json({ error: 'Password is required' });
+    }
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    // Password validation
+    if (password.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters long' });
+    }
+    if (!/[A-Z]/.test(password) || !/[a-z]/.test(password) || !/[0-9]/.test(password) || !/[^A-Za-z0-9]/.test(password)) {
+      return res.status(400).json({ error: 'Password must include uppercase, lowercase, numbers, and special characters' });
+    }
+
+    const token = await getGraphToken();
+
+    // Update user's password and invitation state
+    const updateUserResponse = await fetch(`https://graph.microsoft.com/v1.0/users/${userId}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`
+      },
+      body: JSON.stringify({
+        passwordProfile: {
+          forceChangePasswordNextSignIn: true, // Require password change on next login
+          password
+        },
+      })
+    });
+
+    if (updateUserResponse.ok) {
+      res.json({
+        success: true,
+        message: 'Password set succesfully'
+      });
+    } else {
+      const errorData = await updateUserResponse.json();
+      res.status(updateUserResponse.status).json({ error: 'Failed to update user', details: errorData.error });
+    }
+  } catch (error) {
+    res.status(500).json({ error: 'Server error', details: error.message });
+  }
+});
+
 // Start the server
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
