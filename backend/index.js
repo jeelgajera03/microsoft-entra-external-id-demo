@@ -8,6 +8,7 @@ const axios = require('axios');
 const nodemailer = require('nodemailer');
 const cors = require('cors');
 
+
 // Load environment variables
 dotenv.config();
 
@@ -232,7 +233,44 @@ app.post('/api/set-password', async (req, res) => {
   }
 });
 
+// API: Setup MFA Email
+app.post('/api/setup-mfa', async (req, res) => {
+  try {
+    const { userId, mfaEmail } = req.body;
 
+    // Validate inputs
+    if (!userId || !mfaEmail) {
+      return res.status(400).json({ error: 'User ID and MFA email are required' });
+    }
+
+    // Validate email format
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(mfaEmail)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+
+    // Add email as MFA authentication method via Graph API
+    const accessToken = await getGraphToken();
+    const graphApiUrl = `https://graph.microsoft.com/v1.0/users/${userId}/authentication/emailMethods`;
+    await axios.post(
+      graphApiUrl,
+      { emailAddress: mfaEmail },
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+
+    res.json({
+      success: true,
+      message: 'MFA email added successfully. It will be used for MFA during sign-in.',
+    });
+  } catch (error) {
+    console.error('Error:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Server error', details: error.message });
+  }
+});
 
 // Start the server
 app.listen(PORT, () => {
