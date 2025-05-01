@@ -2,6 +2,8 @@ const express = require('express');
 const msal = require('@azure/msal-node');
 const bodyParser = require('body-parser');
 const path = require('path');
+const jwt = require('jsonwebtoken');
+const jwksClient = require('jwks-rsa');
 const dotenv = require('dotenv');
 const crypto = require('crypto');
 const axios = require('axios');
@@ -26,14 +28,6 @@ app.use(cors({
   credentials: true // if you are using cookies
 
 }));
-
-
-
-// In-memory store for OTP codes (in production, use a database)
-const otpStore = new Map(); // userId -> { code, expiresAt }
-const mfaStore = new Map(); // userId -> { mfaEmail, enabled }
-const sessionStore = new Map(); // sessionId -> { userId, expiresAt }
-
 // MSAL Configuration
 const msalConfig = {
   auth: {
@@ -62,16 +56,152 @@ async function getGraphToken() {
   const response = await cca.acquireTokenByClientCredential(tokenRequest);
   return response.accessToken;
 }
-
-// Generate secure random OTP
-function generateOTP() {
-  return crypto.randomInt(100000, 999999).toString();
+const clientId = process.env.CLIENT_ID;
+const tenantId = process.env.TENANT_ID;
+// const authority = `https://entraidauth12.ciamlogin.com/${process.env.TENANT_ID}`;
+const authority = `https://c3db1e68-955c-4423-ad2a-447e56ea3190.ciamlogin.com/${tenantId}`; // Updated authority
+const redirectUri = 'http://localhost:3000/auth/callback';
+// JWKS client for fetching Microsoft's public keys
+const client = jwksClient({
+  jwksUri: `${authority}/discovery/v2.0/keys`
+});
+// Function to get user profile from Graph API
+async function getUserProfile(userId) {
+  const accessToken = await getGraphToken();
+  try {
+    const response = await axios.get(`https://graph.microsoft.com/v1.0/users/${userId}`, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`
+      }
+    });
+    return response.data;
+  } catch (error) {
+    throw new Error(`Failed to fetch user profile: ${error.response?.data?.error?.message || error.message}`);
+  }
 }
 
-// Generate a session token
-function generateSessionToken() {
-  return crypto.randomBytes(32).toString('hex');
+// Function to get signing key
+async function getSigningKey(kid) {
+  return new Promise((resolve, reject) => {
+    client.getSigningKey(kid, (err, key) => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve(key.getPublicKey());
+      }
+    });
+  });
 }
+
+async function getUserDetailsFromIdToken(idToken) {
+  try {
+    // Validate input
+    if (!idToken) {
+      throw new Error('No id_token provided');
+    }
+
+    // Decode token to get header and payload
+    const decodedToken = jwt.decode(idToken, { complete: true });
+    if (!decodedToken) {
+      throw new Error('Invalid token');
+    }
+
+    // Get signing key
+    const { kid } = decodedToken.header;
+    const signingKey = await getSigningKey(kid);
+
+    // Verify token
+    const verifiedToken = jwt.verify(idToken, signingKey, {
+      audience: clientId,
+      issuer: `${authority}/v2.0`,
+      algorithms: ['RS256'],
+      nonce: 'S51xbn_lhC'
+    });
+
+    // Extract and return user details
+    return {
+      id: verifiedToken.oid || verifiedToken.sub,
+      email: verifiedToken.email || verifiedToken.upn,
+    };
+  } catch (error) {
+    console.error('Error processing ID token:', error.message);
+    throw error;
+  }
+}
+
+// Add this middleware function near your other middleware
+const validateAccessToken = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return res.status(401).json({ error: 'Authorization header missing' });
+    }
+
+    const token = authHeader.split(' ')[1];
+    if (!token) {
+      return res.status(401).json({ error: 'Access token missing' });
+    }
+
+    // Decode token to get header
+    const decodedToken = jwt.decode(token, { complete: true });
+    if (!decodedToken) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+
+    // Get signing key
+    const { kid } = decodedToken.header;
+    const signingKey = await getSigningKey(kid);
+
+    // Verify token
+    const verifiedToken = jwt.verify(token, signingKey, {
+      audience: clientId,
+      issuer: `${authority}/v2.0`,
+      algorithms: ['RS256']
+    });
+
+    // Attach user info to request
+    req.user = {
+      id: verifiedToken.oid || verifiedToken.sub,
+      email: verifiedToken.email || verifiedToken.upn
+    };
+
+    next();
+  } catch (error) {
+    console.error('Token validation error:', error.message);
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+};
+
+const validateUserToken = (req, res, next) => {
+  try {
+    const token = req.query.token || req.headers.authorization?.split(' ')[1];
+    
+    if (!token) {
+      return res.status(401).json({ error: 'Authorization token missing' });
+    }
+
+    // Verify the token
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'a0d6ffdd9039ed850d94296a36eaac6303d2e07cda2a9c56b4e923c98be2e4b4');
+    
+    // Attach user to request
+    req.user = {
+      id: decoded.id,
+      email: decoded.email,
+      name: decoded.name
+    };
+
+    console.log({
+      id: decoded.id,
+      email: decoded.email,
+      name: decoded.name
+    });
+
+    next();
+  } catch (error) {
+    console.error('Token validation error:', error.message);
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+};
 
 // API: Create User
 app.post('/api/create-user', async (req, res) => {
@@ -126,8 +256,19 @@ app.post('/api/create-user', async (req, res) => {
     const userData = createUserResponse.data;
     console.log({userData});
 
-    // Generate custom invitation URL
-    const inviteUrl = `${process.env.BASE_URL}/set-password?userId=${userData.id}`;
+    // Generate a JWT token for the user
+    const userToken = jwt.sign(
+      {
+        id: userData.id,
+        email: email,
+        name: displayName
+      },
+      process.env.JWT_SECRET || 'a0d6ffdd9039ed850d94296a36eaac6303d2e07cda2a9c56b4e923c98be2e4b4', // Use a proper secret from env
+      { expiresIn: '1h' } // Token expires in 1 hour
+    );
+
+    // Generate custom invitation URL with the token
+    const inviteUrl = `${process.env.BASE_URL}/set-password?token=${userToken}`;
 
     // Send custom email using nodemailer
     const mailOptions = {
@@ -150,7 +291,11 @@ app.post('/api/create-user', async (req, res) => {
     res.json({
       success: true,
       message: 'User created and custom invitation email sent',
-      data: { id: userData.id, inviteUrl }
+      data: { 
+        id: userData.id, 
+        inviteUrl,
+        token: userToken // Return the user-specific token
+      },
     });
 
   } catch (error) {
@@ -163,10 +308,10 @@ app.post('/api/create-user', async (req, res) => {
 });
 
 // API: Set Password
-app.post('/api/set-password', async (req, res) => {
+app.post('/api/set-password', validateUserToken, async (req, res) => {
   try {
     const { password } = req.body;
-    const { userId } = req.query;
+    const userId = req.user.id; // Get from token instead of query param
 
     // Validate inputs
     if (!password) {
@@ -233,44 +378,294 @@ app.post('/api/set-password', async (req, res) => {
   }
 });
 
-// API: Setup MFA Email
-app.post('/api/setup-mfa', async (req, res) => {
+// Route to initiate login
+app.get('/login', (req, res) => {
+  const nonce = 'S51xbn_lhC'; // In production, generate a random nonce
+  const authUrl = `${authority}/oauth2/v2.0/authorize?` +
+    `client_id=${process.env.CLIENT_ID}&` +
+    `nonce=${nonce}&` +
+    `redirect_uri=${encodeURIComponent(redirectUri)}&` +
+    `scope=openid profile email&` + // Updated scope
+    // `scope=openid&` +
+    `response_type=id_token&` +
+    `prompt=login`;
+
+  res.redirect(authUrl);
+});
+
+// Route to handle callback
+// Update the callback route to serve a dashboard
+app.get('/auth/callback', async (req, res) => {
   try {
-    const { userId, mfaEmail } = req.body;
+    const idToken = req.query.id_token;
+    if (!idToken) {
+      throw new Error('No id_token provided');
+    }
+    
+    const userData = await getUserDetailsFromIdToken(idToken);
+    const encodedToken = encodeURIComponent(idToken);
 
-    // Validate inputs
-    if (!userId || !mfaEmail) {
-      return res.status(400).json({ error: 'User ID and MFA email are required' });
+    // Serve a dashboard HTML with reset password button
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Dashboard</title>
+        <style>
+          body { font-family: Arial, sans-serif; margin: 0; padding: 20px; }
+          .dashboard { max-width: 800px; margin: 0 auto; }
+          .user-info { background: #f5f5f5; padding: 20px; border-radius: 5px; margin-bottom: 20px; }
+          .actions { display: flex; gap: 10px; }
+          .btn { padding: 10px 15px; background: #007bff; color: white; text-decoration: none; border-radius: 5px; }
+          .btn:hover { background: #0056b3; }
+        </style>
+      </head>
+      <body>
+        <div class="dashboard">
+          <h1>Welcome to Your Dashboard</h1>
+          
+          <div class="user-info">
+            <h2>User Information</h2>
+            <p><strong>ID:</strong> ${userData.id}</p>
+            <p><strong>Email:</strong> ${userData.email}</p>
+          </div>
+          
+          <div class="actions">
+            <a href="/api/request-password-reset" class="btn" onclick="requestReset(event)">Reset Password</a>
+            <!-- Add more action buttons as needed -->
+          </div>
+        </div>
+
+        <script>
+          async function requestReset(e) {
+            e.preventDefault();
+            try {
+              const response = await fetch('/api/request-password-reset', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': 'Bearer ${encodedToken}'
+                }
+              });
+              
+              const result = await response.json();
+              if (response.ok) {
+                alert('Password reset link sent to your email!');
+              } else {
+                alert('Error: ' + (result.error || 'Failed to send reset link'));
+              }
+            } catch (err) {
+              alert('Error: ' + err.message);
+            }
+          }
+        </script>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    console.error('Error processing token:', error.message);
+    res.status(400).send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Login Error</title>
+      </head>
+      <body>
+        <h1>Login Failed</h1>
+        <p>Error: ${error.message}</p>
+      </body>
+      </html>
+    `);
+  }
+});
+
+
+// API: reset-password feature
+// Step 1: Initialize password reset token storage
+// Using in-memory storage for demonstration purposes
+// In production, use a database to store these tokens
+const passwordResetTokens = new Map();
+
+// Step 2: API to request a password reset
+app.post('/api/request-password-reset', validateAccessToken, async (req, res) => {
+  try {
+    const email = req.user.email; // Get from token instead of body
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
     }
 
-    // Validate email format
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(mfaEmail)) {
-      return res.status(400).json({ error: 'Invalid email format' });
-    }
+    const token = await getGraphToken();
 
-    // Add email as MFA authentication method via Graph API
-    const accessToken = await getGraphToken();
-    const graphApiUrl = `https://graph.microsoft.com/v1.0/users/${userId}/authentication/emailMethods`;
-    await axios.post(
-      graphApiUrl,
-      { emailAddress: mfaEmail },
+    // Find user by email using Microsoft Graph API
+    const userResponse = await axios.get(
+      `https://graph.microsoft.com/v1.0/users?$filter=mail eq '${email}' or userPrincipalName eq '${email}'&$select=id,displayName,givenName`,
       {
         headers: {
-          Authorization: `Bearer ${accessToken}`,
+          'Authorization': `Bearer ${token}`
+        }
+      }
+    );
+
+    // Check if user exists
+    if (!userResponse.data.value || userResponse.data.value.length === 0) {
+      // For security, don't reveal if email exists or not
+      return res.json({
+        success: true,
+        message: 'If your email exists in our system, you will receive a password reset link'
+      });
+    }
+
+    const user = userResponse.data.value[0];
+    
+    // Generate a reset token (cryptographically secure)
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    
+    // Store token with expiration (1 hour)
+    passwordResetTokens.set(resetToken, {
+      userId: user.id,
+      email,
+      expires: new Date(Date.now() + 3600000) // 1 hour from now
+    });
+    
+    // Generate password reset URL
+    const resetUrl = `${process.env.BASE_URL}/reset-password?token=${resetToken}`;
+    
+    // Send password reset email
+    const mailOptions = {
+      from: process.env.EMAIL_USER,
+      to: email,
+      subject: 'Password Reset Request',
+      html: `
+        <h2>Hello ${user.givenName || user.displayName},</h2>
+        <p>We received a request to reset your password.</p>
+        <p>Please click the link below to reset your password:</p>
+        <a href="${resetUrl}" style="display: inline-block; padding: 10px 20px; background-color: #007bff; color: white; text-decoration: none; border-radius: 5px;">Reset Password</a>
+        <p>This link will expire in 1 hour.</p>
+        <p>If you didn't request a password reset, you can safely ignore this email.</p>
+        <p>Best regards,<br>The IT Team</p>
+      `
+    };
+    
+    await transporter.sendMail(mailOptions);
+    
+    res.json({
+      success: true, 
+      message: 'Password reset email sent successfully'
+    });
+    
+  } catch (error) {
+    console.error('Error:', error.response?.data || error.message);
+    res.status(500).json({
+      error: 'Server error',
+      details: error.response?.data?.error?.message || error.message
+    });
+  }
+});
+
+// Step 3: API to verify token and reset password
+app.post('/api/reset-password', async (req, res) => {
+  try {
+    const { token, newPassword } = req.body;
+    
+    if (!token || !newPassword) {
+      return res.status(400).json({ error: 'Token and new password are required' });
+    }
+    
+    // Check if token exists and is valid
+    if (!passwordResetTokens.has(token)) {
+      return res.status(400).json({ error: 'Invalid or expired token' });
+    }
+    
+    const tokenData = passwordResetTokens.get(token);
+    
+    // Check if token has expired
+    if (new Date() > tokenData.expires) {
+      passwordResetTokens.delete(token);
+      return res.status(400).json({ error: 'Token has expired' });
+    }
+    
+    // Password validation
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters long' });
+    }
+    if (!/[A-Z]/.test(newPassword) || !/[a-z]/.test(newPassword) || !/[0-9]/.test(newPassword) || !/[^A-Za-z0-9]/.test(newPassword)) {
+      return res.status(400).json({ error: 'Password must include uppercase, lowercase, numbers, and special characters' });
+    }
+    
+    const graphToken = await getGraphToken();
+    
+    // Update user's password using Microsoft Graph API
+    await axios.patch(
+      `https://graph.microsoft.com/v1.0/users/${tokenData.userId}`,
+      {
+        passwordProfile: {
+          forceChangePasswordNextSignIn: false,
+          password: newPassword
+        }
+      },
+      {
+        headers: {
           'Content-Type': 'application/json',
-        },
+          'Authorization': `Bearer ${graphToken}`
+        }
+      }
+    );
+    
+    // Remove the used token
+    passwordResetTokens.delete(token);
+    
+    res.json({
+      success: true,
+      message: 'Password has been reset successfully'
+    });
+    
+  } catch (error) {
+    console.error('Error:', error.response?.data || error.message);
+    res.status(500).json({
+      error: 'Server error',
+      details: error.response?.data?.error?.message || error.message
+    });
+  }
+});
+
+app.get('/api/user-info', validateAccessToken, async (req, res) => {
+  try {
+    const token = await getGraphToken();
+    const userResponse = await axios.get(
+      `https://graph.microsoft.com/v1.0/users/${req.user.id}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
       }
     );
 
     res.json({
       success: true,
-      message: 'MFA email added successfully. It will be used for MFA during sign-in.',
+      user: userResponse.data
     });
   } catch (error) {
     console.error('Error:', error.response?.data || error.message);
-    res.status(500).json({ error: 'Server error', details: error.message });
+    res.status(500).json({
+      error: 'Server error',
+      details: error.response?.data?.error?.message || error.message
+    });
   }
 });
+
+// Add a utility function to clean up expired tokens
+function cleanupExpiredTokens() {
+  const now = new Date();
+  for (const [token, data] of passwordResetTokens.entries()) {
+    if (now > data.expires) {
+      passwordResetTokens.delete(token);
+    }
+  }
+}
+
+// Run cleanup every hour
+setInterval(cleanupExpiredTokens, 3600000); // 1 hour
 
 // Start the server
 app.listen(PORT, () => {
