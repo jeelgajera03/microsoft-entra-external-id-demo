@@ -36,3 +36,34 @@
     transform: rotate(360deg);
   }
 }
+
+/* Custom Styles */
+.navbar {
+  padding: 0.8rem 1rem;
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+}
+
+.btn-primary {
+  background-color: #1a73e8;
+  border-color: #1a73e8;
+}
+
+.btn-primary:hover {
+  background-color: #0d65d9;
+  border-color: #0d65d9;
+}
+
+.form-group {
+  margin-bottom: 1rem;
+}
+
+.card {
+  border-radius: 8px;
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+}
+
+.dashboard-container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px;
+} 

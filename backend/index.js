@@ -174,15 +174,15 @@ const validateAccessToken = async (req, res, next) => {
 
 const validateUserToken = (req, res, next) => {
   try {
-    const token = req.query.token || req.headers.authorization?.split(' ')[1];
-    
+    const token = req.query.token || req.headers.authorization?.split(' ')[1] || req.body.token;
+    console.log(token)
     if (!token) {
       return res.status(401).json({ error: 'Authorization token missing' });
     }
 
     // Verify the token
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'a0d6ffdd9039ed850d94296a36eaac6303d2e07cda2a9c56b4e923c98be2e4b4');
-    
+
     // Attach user to request
     req.user = {
       id: decoded.id,
@@ -190,6 +190,7 @@ const validateUserToken = (req, res, next) => {
       name: decoded.name
     };
 
+    console.log('token info');
     console.log({
       id: decoded.id,
       email: decoded.email,
@@ -254,7 +255,7 @@ app.post('/api/create-user', async (req, res) => {
     });
 
     const userData = createUserResponse.data;
-    console.log({userData});
+    console.log({ userData });
 
     // Generate a JWT token for the user
     const userToken = jwt.sign(
@@ -291,8 +292,8 @@ app.post('/api/create-user', async (req, res) => {
     res.json({
       success: true,
       message: 'User created and custom invitation email sent',
-      data: { 
-        id: userData.id, 
+      data: {
+        id: userData.id,
         inviteUrl,
         token: userToken // Return the user-specific token
       },
@@ -300,9 +301,9 @@ app.post('/api/create-user', async (req, res) => {
 
   } catch (error) {
     console.error('Error:', error.response?.data || error.message);
-    res.status(500).json({ 
-      error: 'Server error', 
-      details: error.response?.data?.error?.message || error.message 
+    res.status(500).json({
+      error: 'Server error',
+      details: error.response?.data?.error?.message || error.message
     });
   }
 });
@@ -371,9 +372,9 @@ app.post('/api/set-password', validateUserToken, async (req, res) => {
     });
   } catch (error) {
     console.error('Error:', error.response?.data || error.message);
-    res.status(500).json({ 
-      error: 'Server error', 
-      details: error.response?.data?.error?.message || error.message 
+    res.status(500).json({
+      error: 'Server error',
+      details: error.response?.data?.error?.message || error.message
     });
   }
 });
@@ -381,12 +382,14 @@ app.post('/api/set-password', validateUserToken, async (req, res) => {
 // Route to initiate login
 app.get('/login', (req, res) => {
   const nonce = 'S51xbn_lhC'; // In production, generate a random nonce
+  // Use redirect_uri from the request or fallback to the default one
+  const customRedirectUri = req.query.redirect_uri || redirectUri;
+  
   const authUrl = `${authority}/oauth2/v2.0/authorize?` +
     `client_id=${process.env.CLIENT_ID}&` +
     `nonce=${nonce}&` +
-    `redirect_uri=${encodeURIComponent(redirectUri)}&` +
+    `redirect_uri=${encodeURIComponent(customRedirectUri)}&` +
     `scope=openid profile email&` + // Updated scope
-    // `scope=openid&` +
     `response_type=id_token&` +
     `prompt=login`;
 
@@ -394,88 +397,32 @@ app.get('/login', (req, res) => {
 });
 
 // Route to handle callback
-// Update the callback route to serve a dashboard
 app.get('/auth/callback', async (req, res) => {
   try {
     const idToken = req.query.id_token;
     if (!idToken) {
-      throw new Error('No id_token provided');
+      return res.status(400).json({ 
+        success: false, 
+        error: 'No id_token provided' 
+      });
     }
-    
+
     const userData = await getUserDetailsFromIdToken(idToken);
-    const encodedToken = encodeURIComponent(idToken);
-
-    // Serve a dashboard HTML with reset password button
-    res.send(`
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <title>Dashboard</title>
-        <style>
-          body { font-family: Arial, sans-serif; margin: 0; padding: 20px; }
-          .dashboard { max-width: 800px; margin: 0 auto; }
-          .user-info { background: #f5f5f5; padding: 20px; border-radius: 5px; margin-bottom: 20px; }
-          .actions { display: flex; gap: 10px; }
-          .btn { padding: 10px 15px; background: #007bff; color: white; text-decoration: none; border-radius: 5px; }
-          .btn:hover { background: #0056b3; }
-        </style>
-      </head>
-      <body>
-        <div class="dashboard">
-          <h1>Welcome to Your Dashboard</h1>
-          
-          <div class="user-info">
-            <h2>User Information</h2>
-            <p><strong>ID:</strong> ${userData.id}</p>
-            <p><strong>Email:</strong> ${userData.email}</p>
-          </div>
-          
-          <div class="actions">
-            <a href="/api/request-password-reset" class="btn" onclick="requestReset(event)">Reset Password</a>
-            <!-- Add more action buttons as needed -->
-          </div>
-        </div>
-
-        <script>
-          async function requestReset(e) {
-            e.preventDefault();
-            try {
-              const response = await fetch('/api/request-password-reset', {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'Authorization': 'Bearer ${encodedToken}'
-                }
-              });
-              
-              const result = await response.json();
-              if (response.ok) {
-                alert('Password reset link sent to your email!');
-              } else {
-                alert('Error: ' + (result.error || 'Failed to send reset link'));
-              }
-            } catch (err) {
-              alert('Error: ' + err.message);
-            }
-          }
-        </script>
-      </body>
-      </html>
-    `);
+    
+    // Return JSON response with token and user data
+    res.json({
+      success: true,
+      data: {
+        user: userData,
+        token: idToken
+      }
+    });
   } catch (error) {
     console.error('Error processing token:', error.message);
-    res.status(400).send(`
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <title>Login Error</title>
-      </head>
-      <body>
-        <h1>Login Failed</h1>
-        <p>Error: ${error.message}</p>
-      </body>
-      </html>
-    `);
+    res.status(400).json({
+      success: false,
+      error: error.message
+    });
   }
 });
 
@@ -517,20 +464,20 @@ app.post('/api/request-password-reset', validateAccessToken, async (req, res) =>
     }
 
     const user = userResponse.data.value[0];
-    
+
     // Generate a reset token (cryptographically secure)
     const resetToken = crypto.randomBytes(32).toString('hex');
-    
+
     // Store token with expiration (1 hour)
     passwordResetTokens.set(resetToken, {
       userId: user.id,
       email,
       expires: new Date(Date.now() + 3600000) // 1 hour from now
     });
-    
+
     // Generate password reset URL
     const resetUrl = `${process.env.BASE_URL}/reset-password?token=${resetToken}`;
-    
+
     // Send password reset email
     const mailOptions = {
       from: process.env.EMAIL_USER,
@@ -546,14 +493,14 @@ app.post('/api/request-password-reset', validateAccessToken, async (req, res) =>
         <p>Best regards,<br>The IT Team</p>
       `
     };
-    
+
     await transporter.sendMail(mailOptions);
-    
+
     res.json({
-      success: true, 
+      success: true,
       message: 'Password reset email sent successfully'
     });
-    
+
   } catch (error) {
     console.error('Error:', error.response?.data || error.message);
     res.status(500).json({
@@ -567,24 +514,24 @@ app.post('/api/request-password-reset', validateAccessToken, async (req, res) =>
 app.post('/api/reset-password', async (req, res) => {
   try {
     const { token, newPassword } = req.body;
-    
+
     if (!token || !newPassword) {
       return res.status(400).json({ error: 'Token and new password are required' });
     }
-    
+
     // Check if token exists and is valid
     if (!passwordResetTokens.has(token)) {
       return res.status(400).json({ error: 'Invalid or expired token' });
     }
-    
+
     const tokenData = passwordResetTokens.get(token);
-    
+
     // Check if token has expired
     if (new Date() > tokenData.expires) {
       passwordResetTokens.delete(token);
       return res.status(400).json({ error: 'Token has expired' });
     }
-    
+
     // Password validation
     if (newPassword.length < 8) {
       return res.status(400).json({ error: 'Password must be at least 8 characters long' });
@@ -592,9 +539,9 @@ app.post('/api/reset-password', async (req, res) => {
     if (!/[A-Z]/.test(newPassword) || !/[a-z]/.test(newPassword) || !/[0-9]/.test(newPassword) || !/[^A-Za-z0-9]/.test(newPassword)) {
       return res.status(400).json({ error: 'Password must include uppercase, lowercase, numbers, and special characters' });
     }
-    
+
     const graphToken = await getGraphToken();
-    
+
     // Update user's password using Microsoft Graph API
     await axios.patch(
       `https://graph.microsoft.com/v1.0/users/${tokenData.userId}`,
@@ -611,15 +558,15 @@ app.post('/api/reset-password', async (req, res) => {
         }
       }
     );
-    
+
     // Remove the used token
     passwordResetTokens.delete(token);
-    
+
     res.json({
       success: true,
       message: 'Password has been reset successfully'
     });
-    
+
   } catch (error) {
     console.error('Error:', error.response?.data || error.message);
     res.status(500).json({
